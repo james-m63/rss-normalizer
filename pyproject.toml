@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rssnorm"
+version = "0.1.0"
+description = "Streaming RSS formatter that normalizes messy feeds without loading them fully into memory"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "james-m63" }]
+
+[tool.setuptools.packages.find]
+include = ["rssnorm*"]
