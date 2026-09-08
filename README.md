@@ -6,8 +6,8 @@ something homegrown), stray whitespace and line breaks inside titles,
 missing fields, and occasionally tens of megabytes of `<item>` elements
 from a feed that never got trimmed.
 
-This is a small formatter that reads an RSS 2.0 document and yields one
-normalized item at a time:
+This is a small formatter that reads an RSS 2.0 or Atom document and yields
+one normalized item at a time:
 
 - `pubDate` parsed and rewritten as UTC ISO 8601, original kept alongside
   in case the parse was wrong or you need it
@@ -57,11 +57,16 @@ FeedItem(
 )
 ```
 
+Atom `<entry>` elements are read the same way and mapped onto the same
+`FeedItem` shape: `id` becomes `guid`, `summary` (falling back to `content`)
+becomes `description`, and `published` (falling back to `updated`) becomes
+`pub_date`. `<link href="...">` is read from the first `alternate` (or
+rel-less) link in the entry.
+
 ## Current limitations
 
 This is the first working version, not a complete parser:
 
-- only RSS 2.0 `<item>` elements are read; Atom `<entry>` is not handled yet
 - feeds with real (non-CDATA) markup inside `<description>` will confuse
   the field extraction, since it assumes item fields have no child elements
 - no charset sniffing beyond what the XML parser does on its own
