@@ -67,8 +67,12 @@ rel-less) link in the entry.
 
 This is the first working version, not a complete parser:
 
-- feeds with real (non-CDATA) markup inside `<description>` will confuse
-  the field extraction, since it assumes item fields have no child elements
+- feeds with real (non-CDATA) markup inside `<description>` have those tags
+  stripped and their text concatenated in - there's no conversion of `<br>`
+  to a newline or the like, since the parser only tracks character content
+- bare `&` and unescaped HTML named entities (`&nbsp;`, `&mdash;`, ...) in
+  text content are repaired before parsing, but a stray unescaped `<` will
+  still abort the parse
 - no charset sniffing beyond what the XML parser does on its own
 
 ## Requirements

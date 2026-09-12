@@ -13,6 +13,149 @@ _CONTAINER_FIELDS = {
 }
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# Real feeds routinely put raw HTML into <description> without CDATA-wrapping
+# or escaping it, e.g. "Fish & Chips" or "&nbsp;" copy-pasted from a CMS.
+# Plain XML rejects both outright (undefined entity / bare ampersand), which
+# would otherwise kill the whole parse over one bad item. We rewrite these
+# before they reach the SAX parser rather than trying to catch and skip the
+# resulting SAXParseException, since that exception aborts the parser and
+# there is no clean way to resume mid-document.
+_XML_ENTITY_NAMES = {b"amp", b"lt", b"gt", b"apos", b"quot"}
+_HTML_ENTITY_CODEPOINTS = {
+    b"nbsp": 0x00A0,
+    b"mdash": 0x2014,
+    b"ndash": 0x2013,
+    b"hellip": 0x2026,
+    b"ldquo": 0x201C,
+    b"rdquo": 0x201D,
+    b"lsquo": 0x2018,
+    b"rsquo": 0x2019,
+    b"copy": 0x00A9,
+    b"reg": 0x00AE,
+    b"trade": 0x2122,
+    b"deg": 0x00B0,
+    b"middot": 0x00B7,
+}
+_AMP_RE = re.compile(rb"&(#x[0-9a-fA-F]+;?|#[0-9]+;?|[a-zA-Z][a-zA-Z0-9]*;?)?")
+
+
+def _replace_amp(match: "re.Match[bytes]") -> bytes:
+    body = match.group(1)
+    if not body:
+        return b"&amp;"
+
+    has_semicolon = body.endswith(b";")
+    core = body[:-1] if has_semicolon else body
+
+    if core.startswith(b"#") or core in _XML_ENTITY_NAMES:
+        return b"&" + core + b";"
+
+    codepoint = _HTML_ENTITY_CODEPOINTS.get(core)
+    if codepoint is not None:
+        return "&#{};".format(codepoint).encode("ascii")
+
+    # Unrecognized name (real or bogus) - escape the ampersand and leave
+    # the rest as literal text rather than guessing at its meaning.
+    return b"&amp;" + body
+
+
+_CDATA_START = b"<![CDATA["
+_CDATA_END = b"]]>"
+
+
+def _partial_prefix_len(data: bytes, pos: int, end: int, marker: bytes) -> int:
+    """Length of the longest suffix of data[pos:end] that is also a proper
+    prefix of `marker` - i.e. how many trailing bytes might be the start
+    of `marker` continuing into the next chunk."""
+    for length in range(min(len(marker) - 1, end - pos), 0, -1):
+        if data[end - length:end] == marker[:length]:
+            return length
+    return 0
+
+
+def _entity_holdback_len(data: bytes, pos: int, end: int, max_holdback: int) -> int:
+    amp = data.rfind(b"&", pos, end)
+    if amp == -1:
+        return 0
+    tail_len = end - amp
+    if tail_len <= max_holdback and b";" not in data[amp:end]:
+        return tail_len
+    return 0
+
+
+class _EntitySanitizingReader:
+    """Wraps a binary file-like object, repairing bare `&` and unescaped
+    HTML named entities in text content before the XML parser sees them.
+
+    Content inside `<![CDATA[ ... ]]>` sections is passed through
+    untouched, since XML never entity-parses CDATA in the first place -
+    rewriting an "&" there would corrupt it rather than fix anything.
+    Markers and entities can straddle two `read()` calls, so a partial
+    match at the end of a chunk is held back and retried once more data
+    arrives instead of being judged prematurely.
+    """
+
+    _MAX_ENTITY_HOLDBACK = 12  # longer than any entity name/codepoint we know
+
+    def __init__(self, source: BinaryIO) -> None:
+        self._source = source
+        self._pending = b""
+        self._in_cdata = False
+
+    def read(self, size: int) -> bytes:
+        new = self._source.read(size)
+        data = self._pending + new
+        self._pending = b""
+        if not data:
+            return b""
+        return self._process(data, at_eof=not new)
+
+    def _process(self, data: bytes, at_eof: bool) -> bytes:
+        out = bytearray()
+        pos = 0
+        n = len(data)
+
+        while pos < n:
+            if self._in_cdata:
+                end = data.find(_CDATA_END, pos)
+                if end == -1:
+                    if at_eof:
+                        out += data[pos:]
+                    else:
+                        # A trailing run of "]" could be the start of "]]>".
+                        keep = 0
+                        while keep < 2 and keep < n - pos and data[n - 1 - keep] == 0x5D:
+                            keep += 1
+                        out += data[pos:n - keep]
+                        self._pending = data[n - keep:]
+                    pos = n
+                else:
+                    out += data[pos:end + len(_CDATA_END)]
+                    self._in_cdata = False
+                    pos = end + len(_CDATA_END)
+            else:
+                start = data.find(_CDATA_START, pos)
+                if start == -1:
+                    if at_eof:
+                        out += _AMP_RE.sub(_replace_amp, data[pos:])
+                    else:
+                        cdata_hold = _partial_prefix_len(data, pos, n, _CDATA_START)
+                        entity_hold = _entity_holdback_len(
+                            data, pos, n, self._MAX_ENTITY_HOLDBACK
+                        )
+                        hold = max(cdata_hold, entity_hold)
+                        cut = n - hold
+                        out += _AMP_RE.sub(_replace_amp, data[pos:cut])
+                        self._pending = data[cut:]
+                    pos = n
+                else:
+                    out += _AMP_RE.sub(_replace_amp, data[pos:start])
+                    out += data[start:start + len(_CDATA_START)]
+                    self._in_cdata = True
+                    pos = start + len(_CDATA_START)
+
+        return bytes(out)
+
 
 def parse_stream(source: BinaryIO, chunk_size: int = 8192) -> Iterator[FeedItem]:
     """Yield FeedItem objects one at a time from an RSS 2.0 or Atom byte stream.
@@ -26,6 +169,11 @@ def parse_stream(source: BinaryIO, chunk_size: int = 8192) -> Iterator[FeedItem]
     Both RSS 2.0 `<item>` and Atom `<entry>` elements are recognized and
     mapped onto the same FeedItem shape (Atom's `id`/`summary`/`published`
     become `guid`/`description`/`pub_date`).
+
+    Bare `&` and unescaped HTML named entities (`&nbsp;`, `&mdash;`, ...)
+    inside text content are repaired before parsing, since real feeds ship
+    plenty of both and a strict XML parser would otherwise abort on the
+    first one.
     """
     parser = xml.sax.make_parser()
     # Don't fetch external entities/DTDs referenced by the feed - a
@@ -37,8 +185,9 @@ def parse_stream(source: BinaryIO, chunk_size: int = 8192) -> Iterator[FeedItem]
     handler = _ItemHandler()
     parser.setContentHandler(handler)
 
+    reader = _EntitySanitizingReader(source)
     while True:
-        chunk = source.read(chunk_size)
+        chunk = reader.read(chunk_size)
         if not chunk:
             break
         parser.feed(chunk)
